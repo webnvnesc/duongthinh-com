@@ -1,4 +1,4 @@
-name: FTP read-only connectivity check
+name: FTPS read-only WordPress source check
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   ftp-check:
-    name: Check FTP access without changing files
+    name: Verify secure FTP login and source file read
     runs-on: ubuntu-latest
     timeout-minutes: 3
     env:
@@ -21,7 +21,7 @@ jobs:
       FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
       FTP_DIRECTORY: /domains/duongthinhio.thegioihosting.io.vn/public_html
     steps:
-      - name: Probe FTP connection and WordPress markers (read-only)
+      - name: Test explicit FTPS without changing live files
         shell: bash
         run: |
           python3 - <<'PY'
@@ -35,70 +35,56 @@ jobs:
           username = os.environ.get("FTP_USERNAME", "")
           password = os.environ.get("FTP_PASSWORD", "")
           target = os.environ["FTP_DIRECTORY"]
-          if not all((server, username, password)):
-              print("FAIL: FTP_SERVER, FTP_USERNAME, or FTP_PASSWORD is missing.")
-              sys.exit(1)
 
+          if not all((server, username, password)):
+              sys.exit("FAIL: Required FTP secrets are missing.")
           raw = server if "://" in server else "//" + server
           parsed = urlsplit(raw)
           host = parsed.hostname
-          port = parsed.port or (990 if parsed.scheme.lower() == "ftps" else 21)
+          port = parsed.port or 21
           if not host:
-              print("FAIL: FTP_SERVER has no usable hostname.")
-              sys.exit(1)
-          print("FTP settings available. Testing connectivity (credentials are never printed).")
+              sys.exit("FAIL: FTP_SERVER does not contain a valid hostname.")
+
           try:
               socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
               print("PASS: FTP server DNS resolves.")
-          except OSError as exc:
-              print("FAIL: FTP server DNS resolution failed:", type(exc).__name__)
+          except OSError:
+              sys.exit("FAIL: FTP server DNS resolution failed.")
+
+          ftp = ftplib.FTP_TLS()
+          try:
+              ftp.connect(host, port, timeout=15)
+              ftp.auth()  # Never send credentials over unencrypted FTP
+              ftp.login(username, password)
+              ftp.prot_p()  # Encrypt file data transfers too
+              ftp.set_pasv(True)
+              print("PASS: Secure explicit FTPS login.")
+
+              ftp.cwd(target)
+              names = ftp.nlst()
+              entries = {item.rstrip("/").split("/")[-1] for item in names}
+              required = {"wp-admin", "wp-content", "wp-includes", "index.php"}
+              if not required.issubset(entries):
+                  sys.exit("FAIL: WordPress source root is missing core markers.")
+              print("PASS: WordPress source root directory can be listed.")
+
+              content = bytearray()
+              def add_chunk(chunk):
+                  if len(content) + len(chunk) > 262144:
+                      raise ValueError("Unexpectedly large version.php")
+                  content.extend(chunk)
+
+              ftp.retrbinary("RETR wp-includes/version.php", add_chunk)
+              if b"$wp_version" not in content:
+                  sys.exit("FAIL: Retrieved file lacks expected WordPress version marker.")
+              print("PASS: Can read WordPress PHP source file over encrypted FTPS.")
+              print("SUCCESS: FTP credentials have read access to the WordPress source.")
+          except (OSError, ftplib.all_errors, ValueError) as exc:
+              print("FAIL: Secure FTP verification failed (", type(exc).__name__, ").")
               sys.exit(1)
-
-          ftp = None
-          for use_tls in (True, False):
-              mode = "explicit FTPS" if use_tls else "FTP"
+          finally:
               try:
-                  ftp = (ftplib.FTP_TLS() if use_tls else ftplib.FTP())
-                  ftp.connect(host, port, timeout=12)
-                  if use_tls:
-                      ftp.auth()
-                  ftp.login(username, password)
-                  if use_tls:
-                      ftp.prot_p()
-                  ftp.set_pasv(True)
-                  print("PASS: Authenticated via", mode)
-                  break
-              except (ftplib.all_errors, OSError) as exc:
-                  print("Connection attempt failed (", mode, "):", type(exc).__name__)
-                  try:
-                      ftp.close()
-                  except Exception:
-                      pass
-                  ftp = None
-
-          if ftp is None:
-              print("FAIL: Could not authenticate to FTP server.")
-              sys.exit(1)
-
-          candidates = [target, target.lstrip("/"), "/public_html", "public_html", "/"]
-          for path in dict.fromkeys(candidates):
-              try:
-                  ftp.cwd(path)
-                  names = ftp.nlst()
-              except (ftplib.all_errors, OSError) as exc:
-                  print("Directory unavailable:", path, "(", type(exc).__name__, ")")
-                  continue
-              entries = set(item.rstrip("/").split("/")[-1] for item in names)
-              markers = ["wp-admin", "wp-content", "wp-includes", "wp-config.php", "index.php"]
-              found = [item for item in markers if item in entries]
-              print("PASS: Can list directory:", path)
-              print("WordPress markers:", ", ".join(found) if found else "(none found)")
-              if {"wp-admin", "wp-content", "wp-includes"}.issubset(entries):
-                  print("SUCCESS: WordPress source root is readable.")
                   ftp.quit()
-                  sys.exit(0)
-
-          ftp.quit()
-          print("FAIL: FTP account connected, but WordPress root was not identified.")
-          sys.exit(1)
+              except Exception:
+                  ftp.close()
           PY

@@ -117,3 +117,50 @@ jobs:
               try: ftp.quit()
               except Exception: ftp.close()
           PY
+
+      - name: Install Playwright for post-deploy verification
+        shell: bash
+        run: |
+          npm install --no-save --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+
+      - name: Validate published CSS, mobile images and desktop isolation
+        shell: bash
+        run: |
+          node <<'NODE'
+          const { chromium, devices }=require('playwright');
+          (async()=>{
+            const browser=await chromium.launch({headless:true});
+            const site="https://duongthinhio.thegioihosting.io.vn/tin-tuc-su-kien/";
+            try{
+              for(const [name, opts] of [
+                ["mobile",{...devices["iPhone 13"],defaultBrowserType:undefined}],
+                ["desktop",{viewport:{width:1440,height:900}}]
+              ]){
+                const page=await browser.newPage(opts);
+                const response=await page.goto(site,{waitUntil:"domcontentloaded",timeout:45000});
+                await page.waitForTimeout(1500);
+                await page.evaluate(async()=>{window.scrollTo(0,900);await new Promise(r=>setTimeout(r,800));window.scrollTo(0,0)});
+                const result=await page.evaluate(()=>{
+                  const style=!!document.querySelector('style#duongthinh-mobile-news-thumbnails');
+                  const imgs=[...document.querySelectorAll('.rt-img-holder img.rt-img-responsive')].slice(0,5);
+                  return {styleInjected:style, images:imgs.map(el=>{
+                    const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+                    return {natural:[el.naturalWidth,el.naturalHeight],rect:[Math.round(r.width),Math.round(r.height)],fit:s.objectFit};
+                  })};
+                });
+                const ok=response.status()===200 && result.styleInjected && result.images.length>=3 &&
+                  result.images.every(el=>{
+                    if(el.natural[0]===0)return false;
+                    const actual=el.rect[0]/el.rect[1],original=el.natural[0]/el.natural[1];
+                    return name==="mobile" ? Math.abs(actual-original)<0.03 && el.fit==="contain" :
+                      el.rect[1]===200 && el.fit==="cover";
+                  });
+                console.log('VERIFY '+name+' '+JSON.stringify({status:response.status(),...result,passed:ok}));
+                await page.screenshot({path:'/tmp/news-'+name+'-after.png',fullPage:true,animations:'disabled'});
+                if(!ok)process.exitCode=1;
+                await page.close();
+              }
+            }finally{await browser.close()}
+          })().catch(e=>{console.error('VERIFY_ERROR',e.name,String(e.message).split('\n')[0]);process.exitCode=1});
+          NODE

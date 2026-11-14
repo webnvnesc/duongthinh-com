@@ -1,0 +1,119 @@
+name: Deploy mobile news image fix to WordPress hosting
+
+on:
+  push:
+    branches: [master]
+    paths: [".github/workflows/deploy-news-thumbnail-fix.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Install scoped mobile CSS in WordPress source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - name: Upload self-contained must-use plugin via encrypted FTPS
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib
+          import io
+          import os
+          import sys
+          from urllib.parse import urlsplit
+
+          base = "/domains/duongthinhio.thegioihosting.io.vn/public_html"
+          dirname = base + "/wp-content/mu-plugins"
+          name = "duongthinh-mobile-news-thumbnails.php"
+          target = dirname + "/" + name
+          content = """<?php
+          /**
+           * Plugin Name: Duong Thinh - News Thumbnails Mobile Fix
+           * Description: Preserve original image aspect ratio for The Post Grid on the news page (mobile only).
+           * Version: 1.0.0
+           */
+          if (!defined('ABSPATH')) {
+              exit;
+          }
+          add_action('wp_head', function () {
+              if (!is_page(356)) {
+                  return;
+              }
+              ?>
+          <style id="duongthinh-mobile-news-thumbnails">
+          @media screen and (max-width: 849px) {
+            body.page-id-356 .rt-img-holder {
+              height: auto !important;
+              min-height: 0 !important;
+              max-height: none !important;
+            }
+            body.page-id-356 .rt-img-holder a {
+              height: auto !important;
+            }
+            body.page-id-356 .rt-img-holder img.rt-img-responsive {
+              display: block !important;
+              width: 100% !important;
+              height: auto !important;
+              max-height: none !important;
+              aspect-ratio: auto !important;
+              object-fit: contain !important;
+            }
+          }
+          </style>
+              <?php
+          }, 99);
+          """
+          content = '\n'.join(line[10:] if line.startswith('          ') else line for line in content.split('\n'))
+          data = content.encode('utf-8')
+          parsed = urlsplit(os.environ["FTP_SERVER"] if "://" in os.environ["FTP_SERVER"] else "//" + os.environ["FTP_SERVER"])
+          ftp = ftplib.FTP_TLS()
+          try:
+              ftp.connect(parsed.hostname, parsed.port or 21, timeout=20)
+              ftp.auth()
+              ftp.login(os.environ["FTP_USERNAME"], os.environ["FTP_PASSWORD"])
+              ftp.prot_p()
+              ftp.cwd(base + "/wp-content")
+              try:
+                  ftp.cwd(dirname)
+                  print("PASS: Existing mu-plugins directory found.")
+              except ftplib.error_perm:
+                  ftp.mkd(dirname)
+                  ftp.cwd(dirname)
+                  print("PASS: Created mu-plugins directory.")
+
+              exists = name in {x.split("/")[-1] for x in ftp.nlst()}
+              if exists:
+                  original = bytearray()
+                  ftp.retrbinary("RETR " + name, original.extend)
+                  if bytes(original) == data:
+                      print("PASS: Desired version already installed (no change).")
+                      sys.exit(0)
+                  if b"Duong Thinh - News Thumbnails Mobile Fix" not in original:
+                      sys.exit("FAIL: Existing unexpected plugin file: no overwrite.")
+                  sys.exit("FAIL: Existing version differs: manual review needed before overwrite.")
+
+              tmpname = name + ".uploading"
+              ftp.storbinary("STOR " + tmpname, io.BytesIO(data))
+              checked = bytearray()
+              ftp.retrbinary("RETR " + tmpname, checked.extend)
+              if bytes(checked) != data:
+                  ftp.delete(tmpname)
+                  sys.exit("FAIL: Uploaded temporary file contents mismatch.")
+
+              ftp.rename(tmpname, name)
+              print("SUCCESS: Installed the WordPress must-use plugin:", "wp-content/mu-plugins/" + name)
+              print("SUCCESS: Only page ID 356, viewport <=849px is targeted.")
+          except (ftplib.all_errors, OSError) as exc:
+              print("FAIL: FTPS deployment error:", type(exc).__name__)
+              sys.exit(1)
+          finally:
+              try: ftp.quit()
+              except Exception: ftp.close()
+          PY

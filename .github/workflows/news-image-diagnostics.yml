@@ -1,0 +1,148 @@
+name: News image responsive diagnostics
+
+on:
+  push:
+    branches: [master]
+    paths: [".github/workflows/news-image-diagnostics.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install browser dependencies
+        run: |
+          npm install --no-save --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+      - name: Inspect desktop and mobile news images on both domains
+        run: |
+          cat > inspect.cjs <<'NODE'
+          const { chromium, devices } = require('playwright');
+          const fs = require('fs');
+          const domains = [
+            "https://duongthinh.com/tin-tuc-su-kien/",
+            "https://duongthinhio.thegioihosting.io.vn/tin-tuc-su-kien/"
+          ];
+          const profiles = [
+            ["desktop", { viewport: { width: 1440, height: 900 } }],
+            ["mobile", { ...devices["iPhone 13"], defaultBrowserType: undefined }]
+          ];
+          fs.mkdirSync("news-diagnostics", { recursive: true });
+          (async () => {
+            const browser = await chromium.launch({headless:true});
+            for (const [di, url] of domains.entries()) {
+              for (const [name, options] of profiles) {
+                const label = (di ? "staging" : "production") + "-" + name;
+                const context = await browser.newContext(options);
+                const page = await context.newPage();
+                try {
+                  const response = await page.goto(url, {waitUntil:"domcontentloaded",timeout:45000});
+                  await page.waitForTimeout(1800);
+                  // Allow lazy thumbnails to load as the user scrolls.
+                  await page.evaluate(async () => {
+                    for (let i = 0; i < 4; i++) {
+                      window.scrollBy(0, 650);
+                      await new Promise(r => setTimeout(r, 220));
+                    }
+                    window.scrollTo(0,0);
+                  });
+                  await page.waitForTimeout(900);
+                  const data = await page.evaluate(() => {
+                    const str = (s,n=240) => String(s||"").slice(0,n);
+                    const pack = el => {
+                      if (!el || el.nodeType !== 1) return null;
+                      const cs=getComputedStyle(el);
+                      const rect=el.getBoundingClientRect();
+                      return {
+                        tag:el.tagName.toLowerCase(), cls:str(el.className?.baseVal??el.className,220),
+                        id:str(el.id,80), style:str(el.getAttribute("style"),150),
+                        rect:[Math.round(rect.width),Math.round(rect.height)],
+                        css:{display:cs.display,position:cs.position,width:cs.width,height:cs.height,
+                          maxHeight:cs.maxHeight,aspectRatio:cs.aspectRatio,objectFit:cs.objectFit,
+                          objectPosition:cs.objectPosition,overflow:cs.overflow,backgroundSize:cs.backgroundSize,
+                          backgroundPosition:cs.backgroundPosition, padding:cs.padding}
+                      };
+                    };
+                    const imgs=[...document.querySelectorAll("img")].map((el,index)=>{
+                      const chain=[];let p=el;
+                      for(let i=0;i<5&&p;i++,p=p.parentElement)chain.push(pack(p));
+                      return {index,src:str(el.currentSrc||el.src,230),alt:str(el.alt,100),
+                        natural:[el.naturalWidth,el.naturalHeight],chain,
+                        closestArticle:str(el.closest("article,.post,.blog-post,.blog-item,.blog,.post-item")?.className,150)};
+                    });
+                    const styleSheets=[...document.querySelectorAll('link[rel="stylesheet"]')].map(a=>a.href).filter(Boolean);
+                    const gallerySelectors=['.post-item','.box-image','.image-cover','.blog-archive','.blog-post',
+                    '.blog-posts','.entry-image','.post-thumbnail','.elementor-post__thumbnail','.elementor-widget-posts',
+                    '.archive','.posts-list','.post-list'];
+                    const matched=gallerySelectors.map(s=>({selector:s,count:document.querySelectorAll(s).length})).filter(x=>x.count>0);
+                    return {title:document.title,href:location.href,h1:[...document.querySelectorAll("h1")].map(el=>str(el.textContent,140)),
+                      imgs,styleSheets,matched,viewport:[innerWidth,innerHeight],
+                      imagesTotal:imgs.length,bodyText:str(document.body.innerText,350)};
+                  });
+                  const info={label,status:response?.status(),title:data.title,url:data.href,
+                    viewport:data.viewport,imagesTotal:data.imagesTotal,matched:data.matched,
+                    h1:data.h1,stylesheets:data.styleSheets.filter(x=>/wp-content|uploads/i.test(x)).slice(0,40)};
+                  console.log("PAGE_START "+JSON.stringify(info));
+                  for (const image of data.imgs.slice(0,30))console.log("IMAGE "+label+" "+JSON.stringify(image));
+                  fs.writeFileSync('news-diagnostics/'+label+'.json',JSON.stringify(data,null,2));
+                  await page.screenshot({path:'news-diagnostics/'+label+'.png',fullPage:true,animations:'disabled',timeout:35000});
+                  console.log("PAGE_DONE "+label);
+                } catch(e){console.log("PAGE_ERROR "+label+" "+e.name+" "+String(e.message).split("\n")[0]);}
+                finally{await context.close();}
+              }
+            }
+            await browser.close();
+          })().catch(e=>{console.error("FATAL "+e.message);process.exit(1)});
+          NODE
+          node inspect.cjs
+      - name: Inspect theme and plugin folder names via encrypted FTPS
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib, os, sys
+          from urllib.parse import urlsplit
+          raw = os.getenv('FTP_SERVER','')
+          user = os.getenv('FTP_USERNAME','')
+          password = os.getenv('FTP_PASSWORD','')
+          if not (raw and user and password):
+              print('FTPS_SKIP missing secrets')
+              sys.exit(0)
+          parsed=urlsplit(raw if '://' in raw else '//'+raw)
+          ftp=ftplib.FTP_TLS()
+          try:
+              ftp.connect(parsed.hostname,parsed.port or 21,timeout=20)
+              ftp.auth()
+              ftp.login(user,password)
+              ftp.prot_p()
+              ftp.cwd('/domains/duongthinhio.thegioihosting.io.vn/public_html')
+              for d in ('wp-content/themes','wp-content/plugins'):
+                  ftp.cwd('/domains/duongthinhio.thegioihosting.io.vn/public_html/'+d)
+                  entries=[x.split('/')[-1] for x in ftp.nlst()]
+                  print('FTPS_DIR '+d+' '+', '.join(entries[:100]))
+              print('FTPS_INSPECTION_SUCCESS')
+          except Exception as e:
+              print('FTPS_INSPECTION_FAILURE '+type(e).__name__)
+          finally:
+              try:ftp.quit()
+              except Exception:ftp.close()
+          PY
+      - name: Upload screenshots and DOM inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-image-inspection
+          path: news-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7

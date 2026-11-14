@@ -94,23 +94,21 @@ jobs:
                   ftp.retrbinary("RETR " + name, original.extend)
                   if bytes(original) == data:
                       print("PASS: Desired version already installed (no change).")
-                      sys.exit(0)
-                  if b"Duong Thinh - News Thumbnails Mobile Fix" not in original:
-                      sys.exit("FAIL: Existing unexpected plugin file: no overwrite.")
-                  sys.exit("FAIL: Existing version differs: manual review needed before overwrite.")
-
-              tmpname = name + ".uploading"
-              ftp.storbinary("STOR " + tmpname, io.BytesIO(data))
-              checked = bytearray()
-              ftp.retrbinary("RETR " + tmpname, checked.extend)
-              if bytes(checked) != data:
-                  ftp.delete(tmpname)
-                  sys.exit("FAIL: Uploaded temporary file contents mismatch.")
-
-              ftp.rename(tmpname, name)
-              print("SUCCESS: Installed the WordPress must-use plugin:", "wp-content/mu-plugins/" + name)
-              print("SUCCESS: Only page ID 356, viewport <=849px is targeted.")
-          except (ftplib.all_errors, OSError) as exc:
+                  else:
+                      print("FAIL: Existing plugin differs; refusing to overwrite.")
+                      raise RuntimeError("unexpected plugin revision")
+              else:
+                  tmpname = name + ".uploading"
+                  ftp.storbinary("STOR " + tmpname, io.BytesIO(data))
+                  checked = bytearray()
+                  ftp.retrbinary("RETR " + tmpname, checked.extend)
+                  if bytes(checked) != data:
+                      ftp.delete(tmpname)
+                      raise RuntimeError("file verification failed")
+                  ftp.rename(tmpname, name)
+                  print("SUCCESS: Installed the WordPress must-use plugin:", "wp-content/mu-plugins/" + name)
+                  print("SUCCESS: Only page ID 356, viewport <=849px is targeted.")
+          except (RuntimeError,) + ftplib.all_errors + (OSError,) as exc:
               print("FAIL: FTPS deployment error:", type(exc).__name__)
               sys.exit(1)
           finally:

@@ -1,0 +1,122 @@
+name: Preflight mobile news thumbnail CSS fix
+
+on:
+  push:
+    branches: [master]
+    paths: [".github/workflows/news-thumbnail-preflight.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Inspect WordPress source and test CSS in browser only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Chromium Playwright
+        shell: bash
+        run: |
+          npm install --no-save --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+      - name: Preflight mobile DOM and CSS preview
+        shell: bash
+        run: |
+          mkdir -p previews
+          cat > preview.cjs <<'NODE'
+          const { chromium, devices } = require('playwright');
+          const site = "https://duongthinhio.thegioihosting.io.vn/tin-tuc-su-kien/";
+          const metrics = async page => page.evaluate(() => {
+            const imgs = [...document.querySelectorAll(".rt-img-holder img.rt-img-responsive")].slice(0, 8);
+            const state = img => {
+              const holder=img.closest(".rt-img-holder");
+              const a=img.closest("a");
+              const r=img.getBoundingClientRect();
+              const h=holder?.getBoundingClientRect();
+              const s=getComputedStyle(img);
+              const sh=holder ? getComputedStyle(holder) : null;
+              return { natural:[img.naturalWidth,img.naturalHeight],
+                img:[Math.round(r.width),Math.round(r.height)],
+                holder:[Math.round(h?.width||0),Math.round(h?.height||0)],
+                fit:s.objectFit, height:s.height, position:s.position, aspect:s.aspectRatio,
+                holderOverflow:sh?.overflow, holderHeight:sh?.height,
+                ancestorClasses:[img, a, holder, holder?.parentElement, holder?.parentElement?.parentElement]
+                  .filter(Boolean).map(e=>[e.tagName.toLowerCase(),String(e.className).slice(0,110)]),
+              };
+            };
+            return { bodyClass:document.body.className, images:imgs.map(state), title:document.title };
+          });
+          (async () => {
+            const browser=await chromium.launch({headless:true});
+            try {
+              const page=await browser.newPage({ ...devices["iPhone 13"], defaultBrowserType:undefined });
+              const response=await page.goto(site,{waitUntil:"domcontentloaded",timeout:45000});
+              await page.waitForTimeout(1300);
+              await page.evaluate(async()=>{window.scrollTo(0,900); await new Promise(r=>setTimeout(r,500)); window.scrollTo(0,0)});
+              const before=await metrics(page);
+              console.log("PREFLIGHT_HTTP "+response.status());
+              console.log("BEFORE "+JSON.stringify(before));
+              await page.screenshot({path:"previews/mobile-before.png",fullPage:true,animations:"disabled"});
+              const css=`@media(max-width:849px){
+                .rt-img-holder { height:auto !important; min-height:0 !important; max-height:none !important; }
+                .rt-img-holder a { height:auto !important; }
+                .rt-img-holder img.rt-img-responsive {
+                  display:block !important; width:100% !important;
+                  height:auto !important; max-height:none !important;
+                  aspect-ratio:auto !important; object-fit:contain !important;
+                }
+              }`;
+              await page.addStyleTag({content:css});
+              await page.waitForTimeout(300);
+              const after=await metrics(page);
+              console.log("AFTER "+JSON.stringify(after));
+              await page.screenshot({path:"previews/mobile-preview.png",fullPage:true,animations:"disabled"});
+              const valid=after.images.length >= 3 && after.images.every(x => x.natural[0] > 0 && x.img[0] > 0 && 
+                Math.abs((x.img[0] / x.img[1]) - (x.natural[0] / x.natural[1])) < 0.03);
+              console.log("PREVIEW_RESULT "+(valid?"PASS":"FAIL")+" ("+after.images.length+" news images)");
+              if(!valid) process.exitCode=1;
+              await page.close();
+            } finally {await browser.close();}
+          })().catch(e=>{console.error("PREVIEW_ERROR "+e.name+" "+String(e.message).split("\n")[0]);process.exit(1)});
+          NODE
+          node preview.cjs
+      - name: Inspect file path and existing mu-plugins over FTPS (read only)
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib,os
+          from urllib.parse import urlsplit
+          v=os.getenv("FTP_SERVER","")
+          p=urlsplit(v if "://" in v else "//"+v)
+          ftp=ftplib.FTP_TLS()
+          root="/domains/duongthinhio.thegioihosting.io.vn/public_html"
+          try:
+              ftp.connect(p.hostname,p.port or 21,timeout=20)
+              ftp.auth();ftp.login(os.getenv("FTP_USERNAME"),os.getenv("FTP_PASSWORD"));ftp.prot_p()
+              for dir in ["wp-content","wp-content/mu-plugins","wp-content/themes"]:
+                  try:
+                      ftp.cwd(root+"/"+dir)
+                      print("FTPS_DIR",dir," ".join([f.split("/")[-1] for f in ftp.nlst()][:30]))
+                  except ftplib.all_errors as e: print("FTPS_DIR_UNAVAILABLE",dir,type(e).__name__)
+          except Exception as e: print("FTPS_ERROR",type(e).__name__)
+          finally:
+              try:ftp.quit()
+              except Exception:ftp.close()
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-news-image-css-preview
+          path: previews/
+          retention-days: 7
+          if-no-files-found: warn

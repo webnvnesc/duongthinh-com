@@ -1,0 +1,104 @@
+name: FTP read-only connectivity check
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/ftp-readonly-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ftp-check:
+    name: Check FTP access without changing files
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+      FTP_DIRECTORY: /domains/duongthinhio.thegioihosting.io.vn/public_html
+    steps:
+      - name: Probe FTP connection and WordPress markers (read-only)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib
+          import os
+          import socket
+          import sys
+          from urllib.parse import urlsplit
+
+          server = os.environ.get("FTP_SERVER", "").strip()
+          username = os.environ.get("FTP_USERNAME", "")
+          password = os.environ.get("FTP_PASSWORD", "")
+          target = os.environ["FTP_DIRECTORY"]
+          if not all((server, username, password)):
+              print("FAIL: FTP_SERVER, FTP_USERNAME, or FTP_PASSWORD is missing.")
+              sys.exit(1)
+
+          raw = server if "://" in server else "//" + server
+          parsed = urlsplit(raw)
+          host = parsed.hostname
+          port = parsed.port or (990 if parsed.scheme.lower() == "ftps" else 21)
+          if not host:
+              print("FAIL: FTP_SERVER has no usable hostname.")
+              sys.exit(1)
+          print("FTP settings available. Testing connectivity (credentials are never printed).")
+          try:
+              socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+              print("PASS: FTP server DNS resolves.")
+          except OSError as exc:
+              print("FAIL: FTP server DNS resolution failed:", type(exc).__name__)
+              sys.exit(1)
+
+          ftp = None
+          for use_tls in (True, False):
+              mode = "explicit FTPS" if use_tls else "FTP"
+              try:
+                  ftp = (ftplib.FTP_TLS() if use_tls else ftplib.FTP())
+                  ftp.connect(host, port, timeout=12)
+                  if use_tls:
+                      ftp.auth()
+                  ftp.login(username, password)
+                  if use_tls:
+                      ftp.prot_p()
+                  ftp.set_pasv(True)
+                  print("PASS: Authenticated via", mode)
+                  break
+              except (ftplib.all_errors, OSError) as exc:
+                  print("Connection attempt failed (", mode, "):", type(exc).__name__)
+                  try:
+                      ftp.close()
+                  except Exception:
+                      pass
+                  ftp = None
+
+          if ftp is None:
+              print("FAIL: Could not authenticate to FTP server.")
+              sys.exit(1)
+
+          candidates = [target, target.lstrip("/"), "/public_html", "public_html", "/"]
+          for path in dict.fromkeys(candidates):
+              try:
+                  ftp.cwd(path)
+                  names = ftp.nlst()
+              except (ftplib.all_errors, OSError) as exc:
+                  print("Directory unavailable:", path, "(", type(exc).__name__, ")")
+                  continue
+              entries = set(item.rstrip("/").split("/")[-1] for item in names)
+              markers = ["wp-admin", "wp-content", "wp-includes", "wp-config.php", "index.php"]
+              found = [item for item in markers if item in entries]
+              print("PASS: Can list directory:", path)
+              print("WordPress markers:", ", ".join(found) if found else "(none found)")
+              if {"wp-admin", "wp-content", "wp-includes"}.issubset(entries):
+                  print("SUCCESS: WordPress source root is readable.")
+                  ftp.quit()
+                  sys.exit(0)
+
+          ftp.quit()
+          print("FAIL: FTP account connected, but WordPress root was not identified.")
+          sys.exit(1)
+          PY

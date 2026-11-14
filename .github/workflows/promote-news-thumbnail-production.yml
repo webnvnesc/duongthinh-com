@@ -1,0 +1,239 @@
+name: Promote validated mobile news thumbnails to production
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/promote-news-thumbnail-production.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Copy reviewed WordPress fix to duongthinh.com and verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - name: Preflight production page identity and source access
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib
+          import os
+          import re
+          import ssl
+          import sys
+          import urllib.request
+          from urllib.parse import urlsplit
+
+          url = "https://duongthinh.com/tin-tuc-su-kien/"
+          req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0 (compatible; NewsThumbnailPreflight/1.0)"})
+          with urllib.request.urlopen(req, timeout=30, context=ssl.create_default_context()) as resp:
+              html = resp.read(800000).decode("utf-8",errors="replace")
+              status = resp.status
+          print("Production news page status:", status)
+          if status != 200 or not re.search(r'page-id-356(?:\s|")', html):
+              sys.exit("FAIL: Production page ID does not match tested page 356.")
+          if "rt-img-responsive" not in html:
+              sys.exit("FAIL: Production page does not contain The Post Grid image selectors.")
+          print("PASS: Production page uses ID 356 and The Post Grid.")
+
+          base = "/domains/duongthinh.com/public_html"
+          stage = "/domains/duongthinhio.thegioihosting.io.vn/public_html"
+          filename = "duongthinh-mobile-news-thumbnails.php"
+          parsed = urlsplit(os.environ["FTP_SERVER"] if "://" in os.environ["FTP_SERVER"] else "//" + os.environ["FTP_SERVER"])
+          ftp = ftplib.FTP_TLS()
+          try:
+              ftp.connect(parsed.hostname, parsed.port or 21,timeout=20)
+              ftp.auth()
+              ftp.login(os.environ["FTP_USERNAME"],os.environ["FTP_PASSWORD"])
+              ftp.prot_p()
+              for root, label in ((stage, "STAGING"),(base,"PRODUCTION")):
+                  ftp.cwd(root)
+                  entries = {x.split("/")[-1] for x in ftp.nlst()}
+                  required = {"wp-admin","wp-content","wp-includes","index.php"}
+                  if not required.issubset(entries):
+                      sys.exit("FAIL: "+label+" path does not look like WordPress.")
+                  print("PASS:",label,"WordPress root is readable.")
+              ftp.cwd(stage+"/wp-content/mu-plugins")
+              if filename not in {x.split("/")[-1] for x in ftp.nlst()}:
+                  sys.exit("FAIL: Tested source patch not found on staging.")
+              data = bytearray()
+              ftp.retrbinary("RETR "+filename, data.extend)
+              if (len(data)>30000 or not data.startswith(b"<?php") or
+                  b"Duong Thinh - News Thumbnails Mobile Fix" not in data or
+                  b"is_page(356)" not in data or b"duongthinh-mobile-news-thumbnails" not in data):
+                  sys.exit("FAIL: Staging patch signature did not match.")
+              print("PASS: Tested staging patch exists and passed signature checks.")
+              ftp.cwd(base+"/wp-content")
+              entries = {x.split("/")[-1] for x in ftp.nlst()}
+              if "mu-plugins" in entries:
+                  ftp.cwd(base+"/wp-content/mu-plugins")
+                  if filename in {x.split("/")[-1] for x in ftp.nlst()}:
+                      current = bytearray()
+                      ftp.retrbinary("RETR "+filename, current.extend)
+                      if current != data:
+                          sys.exit("FAIL: Different production patch exists; will not overwrite.")
+                      print("PASS: Production patch already matches staging.")
+                  else:
+                      print("PASS: Production destination available for new file.")
+              else:
+                  print("PASS: Production mu-plugins directory needs creation.")
+          finally:
+              try:ftp.quit()
+              except Exception:ftp.close()
+          PY
+
+      - name: Promote exact tested file to production via FTPS
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib
+          import hashlib
+          import io
+          import os
+          import sys
+          from urllib.parse import urlsplit
+
+          source_dir = "/domains/duongthinhio.thegioihosting.io.vn/public_html/wp-content/mu-plugins"
+          wp_content = "/domains/duongthinh.com/public_html/wp-content"
+          prod_dir = wp_content+"/mu-plugins"
+          filename = "duongthinh-mobile-news-thumbnails.php"
+          parsed = urlsplit(os.environ["FTP_SERVER"] if "://" in os.environ["FTP_SERVER"] else "//" + os.environ["FTP_SERVER"])
+          ftp = ftplib.FTP_TLS()
+          tmp = filename + ".uploading"
+          try:
+              ftp.connect(parsed.hostname,parsed.port or 21,timeout=25)
+              ftp.auth()
+              ftp.login(os.environ["FTP_USERNAME"],os.environ["FTP_PASSWORD"])
+              ftp.prot_p()
+              ftp.cwd(source_dir)
+              data = bytearray()
+              ftp.retrbinary("RETR "+filename, data.extend)
+              print("SOURCE_SHA256",hashlib.sha256(data).hexdigest())
+              if not data.startswith(b"<?php") or len(data)>30000 or b"is_page(356)" not in data:
+                  sys.exit("FAIL: Invalid source patch.")
+
+              ftp.cwd(wp_content)
+              folders = {x.split("/")[-1] for x in ftp.nlst()}
+              if "mu-plugins" not in folders:
+                  ftp.mkd(prod_dir)
+                  print("PASS: Created production mu-plugins directory.")
+              ftp.cwd(prod_dir)
+              names = {x.split("/")[-1] for x in ftp.nlst()}
+              if filename in names:
+                  existing = bytearray()
+                  ftp.retrbinary("RETR "+filename,existing.extend)
+                  if data != existing:
+                      sys.exit("FAIL: Existing production file differs; aborting without overwrite.")
+                  print("PASS: Production file already equals staging version.")
+              else:
+                  if tmp in names:
+                      sys.exit("FAIL: Existing temporary file found; no changes made.")
+                  ftp.storbinary("STOR "+tmp,io.BytesIO(data))
+                  readback = bytearray()
+                  ftp.retrbinary("RETR "+tmp,readback.extend)
+                  if readback != data:
+                      ftp.delete(tmp)
+                      sys.exit("FAIL: Uploaded file mismatch; temporary file deleted.")
+                  ftp.rename(tmp,filename)
+                  print("PASS: New production plugin installed without modifying original theme or plugins.")
+              final = bytearray()
+              ftp.retrbinary("RETR "+filename,final.extend)
+              if final != data:
+                  sys.exit("FAIL: Final production file verification failed.")
+              print("SUCCESS: Verified exact bytes at /domains/duongthinh.com/public_html/wp-content/mu-plugins/"+filename)
+              print("PRODUCTION_SHA256",hashlib.sha256(final).hexdigest())
+          except (OSError,RuntimeError)+ftplib.all_errors as exc:
+              print("FAIL: FTPS operation failed:",type(exc).__name__)
+              sys.exit(1)
+          finally:
+              try: ftp.quit()
+              except Exception:ftp.close()
+          PY
+
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Chromium Playwright
+        run: |
+          npm install --no-save --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+
+      - name: Validate real production browser layouts
+        shell: bash
+        run: |
+          mkdir -p production-news-proof
+          cat > verify.cjs <<'NODE'
+          const { chromium, devices }=require('playwright');
+          const fs = require('fs');
+          const url='https://duongthinh.com/tin-tuc-su-kien/';
+          const results=[];
+          (async()=>{
+            const browser=await chromium.launch({headless:true});
+            try {
+              for(const [name,opts] of [
+                ['mobile',{...devices['iPhone 13'],defaultBrowserType:undefined}],
+                ['desktop',{viewport:{width:1440,height:900}}]
+              ]){
+                const page=await browser.newPage(opts);
+                let scriptErrors=0;
+                page.on('pageerror',()=>scriptErrors++);
+                const response=await page.goto(url,{waitUntil:'domcontentloaded',timeout:45000});
+                await page.waitForTimeout(1000);
+                await page.evaluate(async()=>{for(let i=0;i<4;i++){window.scrollBy(0,500);await new Promise(r=>setTimeout(r,180));}window.scrollTo(0,0);});
+                await page.waitForTimeout(800);
+                const data=await page.evaluate(()=>{
+                  const imgs=[...document.querySelectorAll('.rt-img-holder img.rt-img-responsive')].slice(0,5);
+                  return {
+                    bodyClass: document.body.className.slice(0,280),
+                    fixPresent: !!document.querySelector('style#duongthinh-mobile-news-thumbnails'),
+                    imgs: imgs.map(img=>{
+                      const r=img.getBoundingClientRect(),cs=getComputedStyle(img);
+                      return {natural:[img.naturalWidth,img.naturalHeight],
+                        rendered:[Math.round(r.width),Math.round(r.height)],
+                        objectFit:cs.objectFit};
+                    })
+                  };
+                });
+                const passed=response.status()===200 && data.bodyClass.includes('page-id-356') &&
+                  data.fixPresent && data.imgs.length>=3 && data.imgs.every(img=>{
+                    if(img.natural[0]===0 || img.rendered[1]===0) return false;
+                    return name==='mobile'
+                      ? Math.abs(img.natural[0]/img.natural[1]-img.rendered[0]/img.rendered[1])<0.03 && img.objectFit==='contain'
+                      : img.rendered[1]===200 && img.objectFit==='cover';
+                  });
+                const result={name,status:response.status(),fixPresent:data.fixPresent,
+                  images:data.imgs,scriptErrors,passed};
+                results.push(result);
+                console.log('PRODUCTION_VERIFY '+JSON.stringify(result));
+                await page.screenshot({path:'production-news-proof/'+name+'.png',fullPage:true,animations:'disabled',timeout:25000});
+                await page.close();
+              }
+            }finally{await browser.close();}
+            fs.writeFileSync('production-news-proof/report.json',JSON.stringify(results,null,2));
+            if(results.length!==2||results.some(r=>!r.passed)){
+              console.log('FAIL: Production mobile/desktop verification failed.');
+              process.exitCode=1;
+            } else {
+              console.log('SUCCESS: Production mobile image aspect ratios fixed; desktop is unchanged.');
+            }
+          })().catch(e=>{console.error('FAIL: Browser check:',e.name,String(e.message).split('\n')[0]);process.exitCode=1});
+          NODE
+          node verify.cjs
+
+      - name: Upload production screenshots and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-news-thumbnail-proof
+          path: production-news-proof/
+          retention-days: 7
+          if-no-files-found: warn

@@ -1,0 +1,153 @@
+name: Diagnose WordPress page editor permissions
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/check-wp-page-access.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect logged-in access to Pages (read-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - name: Inspect WordPress account role, menus, page editor and access denials
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, json, sys, html, ftplib, io, ssl, http.cookiejar
+          import urllib.request, urllib.error, urllib.parse
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit
+
+          base="https://duongthinh.com"
+          jar=http.cookiejar.CookieJar()
+          opener=urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(jar),
+              urllib.request.HTTPSHandler(context=ssl.create_default_context())
+          )
+          def request(path, data=None, headers=None):
+              req=urllib.request.Request(base+path,data=data,headers={
+                  "User-Agent":"Mozilla/5.0 (compatible; WordPressAccessAudit/1.0)",
+                  **({"Content-Type":"application/x-www-form-urlencoded"} if data is not None else {}),
+                  **(headers or {})
+              })
+              try:
+                  with opener.open(req,timeout=18) as r:
+                      return r.status,r.url,r.read(500000).decode("utf-8","replace")
+              except urllib.error.HTTPError as e:
+                  return e.code,e.url,e.read(500000).decode("utf-8","replace")
+          def text_only(raw):
+              raw=re.sub(r'(?is)<(script|style)\b.*?</\1>', ' ',raw)
+              raw=re.sub(r'(?s)<[^>]+>', ' ',raw)
+              return re.sub(r'\s+',' ',html.unescape(raw)).strip()
+          def notice(raw):
+              m=re.search(r'<(?:div|p)[^>]*class="[^"]*(?:wp-die-message|notice-error)[^"]*"[^>]*>(.*?)</(?:div|p)>',raw,re.I|re.S)
+              if m: return text_only(m.group(1))[:240]
+              if "Sorry, you are not allowed to edit this item" in raw: return "Sorry, you are not allowed to edit this item"
+              if "Rất tiếc" in raw: return "Vietnamese WordPress access-denied message"
+              if "not allowed" in raw.lower(): return "WordPress reports access denied"
+              return "(no recognized access-denied notice)"
+          if not os.getenv("WP_ADMIN_USERNAME") or not os.getenv("WP_ADMIN_PASSWORD"):
+              sys.exit("FAIL: Admin secrets are missing")
+          status,url,login=request("/wp-login.php")
+          data=urllib.parse.urlencode({
+              "log":os.getenv("WP_ADMIN_USERNAME"),
+              "pwd":os.getenv("WP_ADMIN_PASSWORD"),
+              "wp-submit":"Log In",
+              "redirect_to":base+"/wp-admin/",
+              "testcookie":"1"
+          }).encode()
+          status,url,page=request("/wp-login.php",data,{"Referer":base+"/wp-login.php"})
+          authed=any(x.name.startswith(("wordpress_logged_in_","wordpress_sec_")) for x in jar)
+          print("AUTH_SESSION",authed,"redirectPath",urlsplit(url).path)
+          if not authed:sys.exit("FAIL: Admin login failed; cannot inspect access")
+          status,url,dashboard=request("/wp-admin/")
+          print("DASHBOARD",status,urlsplit(url).path)
+          for path in ["/wp-admin/edit.php?post_type=page",
+                       "/wp-admin/post.php?post=2&action=edit",
+                       "/wp-admin/profile.php",
+                       "/wp-admin/users.php",
+                       "/wp-admin/plugins.php",
+                       "/wp-admin/themes.php"]:
+              code,final,body=request(path)
+              print("CHECK",path,"status",code,"finalPath",urlsplit(final).path,
+                    "notice",notice(body) if code>=400 else "OK")
+          paths=re.findall(r'<li[^>]*class="[^"]*menu-top[^"]*"[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',dashboard,re.S|re.I)
+          menu=[]
+          for href,caption in paths:
+              title=text_only(caption)[:56]
+              if title:menu.append({"href":href[:90],"name":title})
+          print("ADMIN_VISIBLE_MENU",json.dumps(menu,ensure_ascii=False))
+          profile_text=re.search(r'<li[^>]*id="wp-admin-bar-my-account".*?</li>',dashboard,re.S|re.I)
+          if profile_text:
+              print("ACCOUNT_TOPBAR",text_only(profile_text.group(0))[:180])
+          nonce_status,_,nonce_txt=request("/wp-admin/admin-ajax.php?action=rest-nonce")
+          nonce=nonce_txt.strip()
+          if nonce_status==200 and re.fullmatch("[a-f0-9]{8,12}",nonce):
+              resp_status,_,raw=request("/wp-json/wp/v2/users/me?context=edit",headers={"X-WP-Nonce":nonce})
+              try:
+                  ob=json.loads(raw)
+              except Exception:
+                  ob={}
+              if resp_status==200:
+                  capabilities=ob.get("capabilities",{}) if isinstance(ob,dict) else {}
+                  caps={k:capabilities.get(k) for k in ["read","edit_posts","edit_pages","edit_others_pages",
+                        "edit_published_pages","publish_pages","delete_pages","manage_options","edit_theme_options",
+                        "activate_plugins","list_users","promote_users"]}
+                  print("REST_ME",json.dumps({"id":ob.get("id"),"slug":ob.get("slug"),
+                        "roles":ob.get("roles"),"capabilities":caps},ensure_ascii=False))
+              else:
+                  print("REST_ME_STATUS",resp_status,"code",ob.get("code") if isinstance(ob,dict) else None)
+              resp_status,_,raw=request("/wp-json/wp/v2/pages/2?context=edit",headers={"X-WP-Nonce":nonce})
+              try: ob=json.loads(raw)
+              except Exception:ob={}
+              print("REST_PAGE_EDIT_STATUS",resp_status,"errorCode",ob.get("code") if isinstance(ob,dict) else None)
+          else:
+              print("REST_NONCE_UNAVAILABLE",nonce_status,"(role info not independently verified)")
+
+          # Source inspection over FTPS: read-only. No WP configuration or credentials read.
+          svr=os.getenv("FTP_SERVER","")
+          if svr and os.getenv("FTP_USERNAME") and os.getenv("FTP_PASSWORD"):
+              parsed=urlsplit(svr if "://" in svr else "//"+svr)
+              ftp=ftplib.FTP_TLS()
+              try:
+                  ftp.connect(parsed.hostname,parsed.port or 21,timeout=15)
+                  ftp.auth()
+                  ftp.login(os.getenv("FTP_USERNAME"),os.getenv("FTP_PASSWORD"))
+                  ftp.prot_p()
+                  root="/domains/duongthinh.com/public_html"
+                  for relative in ["wp-content/themes/flatsome/functions.php","wp-content/mu-plugins"]:
+                      try:
+                          if relative.endswith(".php"):
+                              ftp.cwd(root+"/wp-content/themes/flatsome")
+                              data=bytearray()
+                              ftp.retrbinary("RETR functions.php",data.extend)
+                              code=data.decode("utf-8","replace")
+                              flags={x:bool(re.search(x,code)) for x in
+                                  ["remove_menu_page","user_has_cap","map_meta_cap","edit_pages","remove_submenu_page"]}
+                              print("FLATSOME_FUNCTIONS_SECURITY_CALLS",json.dumps(flags))
+                          else:
+                              ftp.cwd(root+"/"+relative)
+                              print("PRODUCTION_MU_PLUGINS",json.dumps(
+                                  [n.rsplit("/",1)[-1] for n in ftp.nlst()][:30]))
+                      except ftplib.all_errors as e:
+                          print("SOURCE_ACCESS",relative,"status",type(e).__name__)
+              except (OSError,)+ftplib.all_errors as e:
+                  print("FTPS_ERROR",type(e).__name__)
+              finally:
+                  try:ftp.quit()
+                  except Exception:ftp.close()
+          print("SUCCESS: WordPress permission inspection completed without changes")
+          PY

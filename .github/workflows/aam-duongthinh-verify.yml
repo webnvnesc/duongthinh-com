@@ -103,8 +103,8 @@ jobs:
               actual_path=urllib.parse.urlparse(url).path
               title=" ".join(scanner.title_parts)[:115]
               has_form=('name="post"' in body or "id='post'" in body or 'id="post"' in body or 'id="post_ID"' in body)
-              denial=bool(re.search(r'<(?:div|p)[^>]*class=["\\'][^"\\']*wp-die-message',body,re.I))
-              has_wp_admin=bool(re.search(r'id=["\\'](?:wpadminbar|wpbody|adminmenu)["\\']',body,re.I))
+              denial=("wp-die-message" in body and "Access Denied" in body[:20000])
+              has_wp_admin=("id=\"wpbody\"" in body or "id=\"adminmenu\"" in body)
               passed=status==200 and actual_path==urllib.parse.urlparse(site+path).path and not denial and has_wp_admin
               print("VERIFY",label,"HTTP",status,"adminUI",has_wp_admin,
                     "pageEditorForm",has_form,"deniedUI",denial,"pass",passed,

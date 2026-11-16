@@ -1,0 +1,153 @@
+name: AAM configuration read-only diagnostics
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/aam-config-diagnostics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+    steps:
+      - name: Verify AAM plugin files and permissions without any writes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ftplib,os,re,sys
+          from urllib.parse import urlsplit
+          url=os.getenv("FTP_SERVER","")
+          p=urlsplit(url if "://" in url else "//"+url)
+          host=p.hostname
+          ftp=ftplib.FTP_TLS()
+          root="/domains/duongthinh.com/public_html/wp-content/plugins/advanced-access-manager"
+          patterns=[
+            ("deny_text", re.compile(r'The access is denied|access is denied',re.I)),
+            ("rest_routes", re.compile(r'register_rest_route|register_rest_field|/aam/|aam/v',re.I)),
+            ("options", re.compile(r'get_option\s*\(|get_site_option\s*\(|get_user_meta\s*\(|update_option\s*\(')),
+            ("access_gate", re.compile(r'edit_pages|remove_menu_page|user_has_cap|map_meta_cap|admin_menu|wp_die',re.I))
+          ]
+          try:
+            ftp.connect(host,p.port or 21,timeout=20)
+            ftp.auth();ftp.login(os.environ["FTP_USERNAME"],os.environ["FTP_PASSWORD"]);ftp.prot_p()
+            ftp.cwd(root)
+            rootnames=[n.rsplit("/",1)[-1] for n in ftp.nlst()]
+            print("AAM_ROOT_FILE_NAMES", " ".join(rootnames[:80]))
+            candidate=[x for x in rootnames if x.lower().endswith('.php')]
+            print("AAM_MAIN_PHP_FILES",candidate)
+            for filename in candidate[:8]:
+              buf=bytearray()
+              ftp.retrbinary("RETR "+filename,buf.extend)
+              s=buf.decode('utf-8','replace')
+              meta={}
+              for key in ["Plugin Name","Version"]:
+                z=re.search(r'^\s*\*?\s*'+re.escape(key)+r'\s*:\s*(.+)$',s,re.M)
+                if z:meta[key]=z.group(1).strip()[:130]
+              print("AAM_PHP",filename,"bytes",len(buf),"metadata",meta)
+              matches=[]
+              for i,line in enumerate(s.splitlines(),1):
+                if len(matches)>=14:break
+                if any(pat.search(line) for _,pat in patterns):
+                  matches.append((i,line.strip()[:200]))
+              print("AAM_MAIN_INTERESTING",filename,matches)
+
+            for dirname in ["application","src","app","config","includes","modules","classes","core"]:
+              try:
+                ftp.cwd(root+"/"+dirname)
+                children=[x.rsplit("/",1)[-1] for x in ftp.nlst()]
+                print("AAM_SUBDIR",dirname,children[:50])
+              except ftplib.all_errors:
+                continue
+          except (OSError,)+ftplib.all_errors as exc:
+            print("AAM_FTPS_ERROR",type(exc).__name__)
+            sys.exit(1)
+          finally:
+            try:ftp.quit()
+            except Exception:ftp.close()
+          PY
+
+      - name: Inspect active plugin and REST namespace using authenticated admin
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,re,ssl,json,http.cookiejar,urllib.error,urllib.parse,urllib.request,sys
+          base="https://duongthinh.com"
+          cookie=http.cookiejar.CookieJar()
+          opener=urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cookie),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context())
+          )
+          def get(path,data=None,nonce=None):
+            hdr={"User-Agent":"Mozilla/5.0 (compatible; AAMConfigReadOnly/1.0)"}
+            if data is not None: hdr["Content-Type"]="application/x-www-form-urlencoded"
+            if nonce: hdr["X-WP-Nonce"]=nonce
+            req=urllib.request.Request(base+path,data=data,headers=hdr)
+            try:
+              with opener.open(req,timeout=25) as response:
+                return response.status,response.url,response.read(900000).decode("utf-8","replace")
+            except urllib.error.HTTPError as exc:
+              return exc.code,exc.url,exc.read(120000).decode("utf-8","replace")
+          try:
+            status,url,_=get("/wp-login.php")
+            form=urllib.parse.urlencode({
+              "log":os.getenv("WP_ADMIN_USERNAME",""),
+              "pwd":os.getenv("WP_ADMIN_PASSWORD",""),
+              "wp-submit":"Log In",
+              "redirect_to":base+"/wp-admin/",
+              "testcookie":"1"}).encode()
+            status,url,_=get("/wp-login.php",form)
+            authed=any(x.name.startswith("wordpress_logged_in_") for x in cookie)
+            print("AAM_LOGIN",authed,"status",status)
+            if not authed:sys.exit(1)
+            status,url,raw=get("/wp-json/")
+            try: index=json.loads(raw)
+            except Exception:index={}
+            namespaces=index.get("namespaces",[]) if isinstance(index,dict) else []
+            print("REST_AAM_NAMESPACES",[n for n in namespaces if "aam" in n.lower() or "access" in n.lower()])
+            if isinstance(index,dict):
+              routes=index.get("routes",{})
+              print("REST_AAM_ROUTES",[k for k in routes if "aam" in k.lower() or "access-manager" in k.lower()][:60])
+            status,_,nonce=get("/wp-admin/admin-ajax.php?action=rest-nonce")
+            nonce=nonce.strip() if status==200 and re.fullmatch('[a-f0-9]{8,12}',nonce.strip()) else None
+            print("WP_REST_NONCE_AVAILABLE",bool(nonce))
+            if nonce:
+              for path in ["/wp-json/wp/v2/users/me?context=edit",
+                           "/wp-json/wp/v2/plugins?context=edit",
+                           "/wp-json/wp/v2/settings"]:
+                status,_,raw=get(path,nonce=nonce)
+                try:obj=json.loads(raw)
+                except Exception:obj={}
+                if path.startswith("/wp-json/wp/v2/users/me"):
+                  print("AAM_ACCOUNT_ROLES",obj.get("roles"),"USERID",obj.get("id"))
+                  c=obj.get("capabilities") or {}
+                  print("AAM_ACCOUNT_CAPS",{k:c.get(k) for k in ["edit_pages","edit_posts","manage_options","activate_plugins","list_users"]})
+                elif "/plugins?" in path:
+                  if isinstance(obj,list):
+                    matching=[{"plugin":x.get("plugin"),"status":x.get("status"),"version":x.get("version")} for x in obj if "advanced-access-manager" in str(x.get("plugin","")) or "access manager" in str(x.get("name","")).lower()]
+                    print("AAM_PLUGIN_STATUS",status,matching,"plugins_total",len(obj))
+                  else: print("AAM_PLUGIN_LIST_DENIED",status,obj.get("code"))
+                else:
+                  print("AAM_REST_SETTINGS_STATUS",status,"aam_keys",[k for k in obj if "aam" in k.lower()][:30] if isinstance(obj,dict) else [])
+            for path in ["/wp-admin/admin.php?page=aam",
+                         "/wp-admin/admin.php?page=aam-settings",
+                         "/wp-admin/edit.php?post_type=page",
+                         "/wp-admin/admin-ajax.php?action=aam"]:
+              status,url,raw=get(path)
+              print("ADMIN_ROUTE",path,"status",status,"dest",urllib.parse.urlparse(url).path,
+                    "denied",bool(re.search("The access is denied",raw,re.I)))
+            print("SUCCESS: Read-only AAM initial diagnostic completed.")
+          except Exception as exc:
+            print("AAM_HTTP_ERROR",type(exc).__name__,str(exc)[:100])
+            sys.exit(1)
+          PY

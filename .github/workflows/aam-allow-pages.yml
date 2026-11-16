@@ -119,9 +119,9 @@ jobs:
           changes=[]
           def rule_path(item):
               ident = str(item["id"])
-              return "/wp-json/aam/v2/backend-menu/" + urllib.parse.quote(ident,safe="") + "?" + params
+              return "/wp-json/aam/v2/backend-menu/" + urllib.parse.quote(ident,safe="=+/") + "?" + params
           def set_restriction(item, restricted):
-              return api(rule_path(item),nonce,"PATCH",{"is_restricted":restricted,"access_level":"role","role_id":slug})
+              return api(rule_path(item),nonce,"POST",{"effect":"deny" if restricted else "allow"})
           def reset_rule(item):
               return api(rule_path(item),nonce,"DELETE")
           try:

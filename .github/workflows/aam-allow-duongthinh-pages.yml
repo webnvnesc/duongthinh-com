@@ -1,0 +1,174 @@
+name: Allow all Pages for DUONG THINH role (AAM)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/aam-allow-duongthinh-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  allow-all-pages:
+    name: Grant Pages menu to DUONG THINH and verify effective admin access
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    env:
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+    steps:
+      - name: Change only Pages permissions, with audit and targeted rollback
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import copy, http.cookiejar, json, os, re, ssl, sys
+          import urllib.error, urllib.parse, urllib.request
+
+          origin = "https://duongthinh.com"
+          jar = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(jar),
+              urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+          def request(path, method="GET", payload=None, nonce=None):
+              headers = {"User-Agent": "Mozilla/5.0 (compatible; AAMDuongThinhPagesFix/1.0)",
+                         "Accept": "application/json,text/html,*/*"}
+              if nonce: headers["X-WP-Nonce"] = nonce
+              if payload is not None:
+                  headers["Content-Type"] = "application/json" if isinstance(payload,(dict,list)) else "application/x-www-form-urlencoded"
+                  payload = json.dumps(payload).encode("utf-8") if isinstance(payload,(dict,list)) else payload
+              req = urllib.request.Request(origin+path, data=payload, headers=headers, method=method)
+              try:
+                  with opener.open(req, timeout=25) as response:
+                      return response.status,response.url,response.read(1000000).decode("utf-8","replace")
+              except urllib.error.HTTPError as e:
+                  return e.code,e.url,e.read(100000).decode("utf-8","replace")
+
+          def api(path,nonce,method="GET",payload=None):
+              code,url,body = request(path,method=method,payload=payload,nonce=nonce)
+              try: data=json.loads(body)
+              except ValueError: data={"code":"non_json"}
+              if code >= 400:
+                  print("API_FAILURE",method,path.split("?")[0],"status",code,"code",data.get("code") if isinstance(data,dict) else "")
+                  raise RuntimeError("AAM request failed")
+              return data
+
+          if not os.environ.get("WP_ADMIN_USERNAME") or not os.environ.get("WP_ADMIN_PASSWORD"):
+              sys.exit("FAIL: Missing admin secrets")
+          status,_,_=request("/wp-login.php")
+          if status != 200: sys.exit("FAIL: WordPress login endpoint unavailable")
+          form=urllib.parse.urlencode({
+              "log":os.environ["WP_ADMIN_USERNAME"],"pwd":os.environ["WP_ADMIN_PASSWORD"],
+              "wp-submit":"Log In","redirect_to":origin+"/wp-admin/","testcookie":"1"}).encode()
+          request("/wp-login.php",method="POST",payload=form)
+          if not any(c.name.startswith("wordpress_logged_in_") for c in jar):
+              sys.exit("FAIL: WordPress login failed")
+          code,_,nonce=request("/wp-admin/admin-ajax.php?action=rest-nonce")
+          nonce=nonce.strip()
+          if code!=200 or not re.fullmatch(r"[0-9a-f]{8,12}",nonce):
+              sys.exit("FAIL: WordPress REST nonce unavailable")
+
+          roles=api("/wp-json/aam/v2/roles",nonce)
+          matches=[r for r in roles if str(r.get("name","")).strip().upper()=="DUONG THINH"]
+          if len(matches)!=1 or not matches[0].get("slug"):
+              sys.exit("FAIL: Could not uniquely identify DUONG THINH role.")
+          slug=matches[0]["slug"]
+          print("ROLE",matches[0]["name"],"MATCHED")
+          me=api("/wp-json/wp/v2/users/me?context=edit",nonce)
+          if slug not in me.get("roles",[]):
+              sys.exit("FAIL: Login account is not in DUONG THINH role. No modifications made.")
+          if not (me.get("capabilities") or {}).get("edit_pages"):
+              sys.exit("FAIL: Account lacks edit_pages. No modifications made.")
+          print("ROLE_AND_CAPABILITY_CONFIRMED","edit_pages",True)
+
+          keys=["menu/edit.php?post_type=page","edit.php?post_type=page","post-new.php?post_type=page"]
+          params=urllib.parse.urlencode({"access_level":"role","role_id":slug})
+          def get_menu():
+              rows=api("/wp-json/aam/v2/backend-menu?"+params,nonce)
+              if not isinstance(rows,list): raise RuntimeError("Invalid AAM menu response")
+              flat=[x for r in rows for x in [r]+(r.get("children") or [])]
+              result={r.get("slug"):r for r in flat}
+              if not all(k in result for k in keys):
+                  raise RuntimeError("Pages menu items missing in AAM")
+              return result
+
+          before=api("/wp-json/aam/v2/settings",nonce)
+          role_scope=before.get("role",{}).get(slug,{})
+          for scope_key in role_scope:
+              if scope_key not in ("backend_menu",):
+                  print("ROLE_ADDITIONAL_SETTINGS",scope_key,"present; kept unchanged")
+          old_rules=copy.deepcopy(role_scope.get("backend_menu") or {})
+          baseline=get_menu()
+          for key in keys:
+              print("BEFORE",key,"restricted",baseline[key].get("is_restricted"),
+                    "rule_effect",(old_rules.get(key) or {}).get("access",{}).get("effect"))
+
+          def endpoint(item):
+              return "/wp-json/aam/v2/backend-menu/"+urllib.parse.quote(str(item["id"]),safe="=+/")+"?"+params
+          changed=[]
+          try:
+              for key in keys:
+                  if baseline[key].get("is_restricted") is False:
+                      print("UNCHANGED",key)
+                      continue
+                  data=api(endpoint(baseline[key]),nonce,"POST",{"effect":"allow"})
+                  if not isinstance(data,dict) or data.get("is_restricted") is not False:
+                      raise RuntimeError("AAM did not confirm allow for "+key)
+                  changed.append(key)
+                  print("ALLOW_SET",key)
+
+              checked=get_menu()
+              final_settings=api("/wp-json/aam/v2/settings",nonce)
+              role_final=final_settings.get("role",{}).get(slug,{})
+              for key in keys:
+                  effect=((role_final.get("backend_menu") or {}).get(key) or {}).get("access",{}).get("effect")
+                  print("VERIFIED",key,"restricted",checked[key].get("is_restricted"),"rule_effect",effect)
+                  if checked[key].get("is_restricted") is not False:
+                      raise RuntimeError("Menu entry still restricted: "+key)
+              # Compare all policies after excluding only these three targeted entries.
+              clean_old=copy.deepcopy(before)
+              clean_new=copy.deepcopy(final_settings)
+              for snap in (clean_old,clean_new):
+                  rules=snap.get("role",{}).get(slug,{}).get("backend_menu",{})
+                  for key in keys: rules.pop(key,None)
+              if clean_old != clean_new:
+                  raise RuntimeError("Unrelated AAM settings changed; please review")
+              print("PASS: All other AAM settings identical.")
+          except Exception:
+              print("CHANGE_FAILED; attempting to restore original targeted rules.")
+              for key in reversed(changed):
+                  try:
+                      old_effect=((old_rules.get(key) or {}).get("access") or {}).get("effect")
+                      if old_effect in ("deny","allow"):
+                          api(endpoint(baseline[key]),nonce,"POST",{"effect":old_effect})
+                      else:
+                          api(endpoint(baseline[key]),nonce,"DELETE")
+                      print("RESTORED",key)
+                  except Exception as exc:
+                      print("RESTORE_FAILED",key,type(exc).__name__)
+              raise
+
+          # Verify real admin URLs and multiple existing Page IDs; role is not page-ID-scoped.
+          all_pass=True
+          for path in [
+              "/wp-admin/edit.php?post_type=page",
+              "/wp-admin/post-new.php?post_type=page",
+              "/wp-admin/post.php?post=2&action=edit",
+              "/wp-admin/post.php?post=356&action=edit"
+          ]:
+              code,url,body=request(path)
+              denied=("The access is denied" in body or "Sorry, you are not allowed" in body)
+              # AAM may serve a localized access-denied body, so require success and retained admin URL.
+              good=(code==200 and not denied and urllib.parse.urlsplit(url).path.startswith("/wp-admin/"))
+              print("ADMIN_PAGE_ACCESS",path,"status",code,"passed",good)
+              if not good:all_pass=False
+
+          q=urllib.parse.urlencode({"context":"edit","per_page":"1"})
+          code,_,body=request("/wp-json/wp/v2/pages?"+q,nonce=nonce)
+          print("ALL_PAGES_REST_EDIT","status",code)
+          if code!=200:all_pass=False
+          if not all_pass:
+              sys.exit("FAIL: AAM role Pages rules changed successfully, but some page editor checks still fail.")
+          print("SUCCESS: DUONG THINH role can access Pages list, add Page, and edit multiple existing pages.")
+          PY

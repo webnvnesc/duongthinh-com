@@ -1,0 +1,51 @@
+name: Inspect AAM backend menu API contract
+
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/aam-api-contract.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - name: Inspect AAM REST route declaration and backend menu controller source without writes
+        run: |
+          python3 - <<'PY'
+          import ftplib,os,re,json,urllib.request
+          from urllib.parse import urlsplit
+          try:
+            with urllib.request.urlopen("https://duongthinh.com/wp-json/",timeout=20) as r:index=json.load(r)
+            for url,details in index.get("routes",{}).items():
+              if url in ("/aam/v2/backend-menu","/aam/v2/backend-menu/(?P<id>[A-Za-z0-9\\/\\+=]+)"):
+                print("ROUTE",url,"endpoints",json.dumps(details.get("endpoints",[]))[:4000])
+          except Exception as e:print("INDEX_ERROR",type(e).__name__)
+          p=urlsplit(os.environ["FTP_SERVER"] if "://" in os.environ["FTP_SERVER"] else "//"+os.environ["FTP_SERVER"])
+          ftp=ftplib.FTP_TLS()
+          base="/domains/duongthinh.com/public_html/wp-content/plugins/advanced-access-manager/application"
+          try:
+            ftp.connect(p.hostname,p.port or 21,timeout=20);ftp.auth()
+            ftp.login(os.environ["FTP_USERNAME"],os.environ["FTP_PASSWORD"]);ftp.prot_p()
+            ftp.cwd(base+"/Restful")
+            listing=[f.rsplit("/",1)[-1] for f in ftp.nlst()]
+            print("RESTFUL_FILES",listing)
+            for f in listing:
+              if "Backend" not in f and "Menu" not in f:continue
+              raw=bytearray();ftp.retrbinary("RETR "+f,raw.extend)
+              code=raw.decode("utf-8","replace")
+              for i,line in enumerate(code.splitlines()):
+                if any(x in line for x in ("register_rest_route","backend-menu","function update","function delete","methods","permission_callback","function create")):
+                  print("SOURCE",f,"line",i+1,"context",json.dumps(code.splitlines()[max(0,i-3):i+12])[:2100])
+          except Exception as e:print("SOURCE_ERROR",type(e).__name__)
+          finally:
+            try:ftp.quit()
+            except Exception:ftp.close()
+          PY

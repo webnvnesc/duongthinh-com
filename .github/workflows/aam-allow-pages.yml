@@ -1,0 +1,177 @@
+name: Restore DUONGTHINH_ADMIN Pages access in AAM
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/aam-allow-pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  allow-pages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+    steps:
+      - name: Update precisely three AAM backend-menu rules and audit result
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import copy, http.cookiejar, json, os, re, ssl, sys
+          import urllib.error, urllib.parse, urllib.request
+
+          origin = "https://duongthinh.com"
+          jar = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(jar),
+              urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+          def request(path, method="GET", payload=None, nonce=None):
+              headers = {
+                  "User-Agent": "Mozilla/5.0 (compatible; AAMTargetedPagesFix/1.0)",
+                  "Accept": "application/json,text/html,*/*",
+              }
+              if nonce: headers["X-WP-Nonce"] = nonce
+              if payload is not None:
+                  headers["Content-Type"] = "application/json" if isinstance(payload, (dict, list)) else "application/x-www-form-urlencoded"
+                  payload = json.dumps(payload).encode("utf-8") if isinstance(payload, (dict, list)) else payload
+              req = urllib.request.Request(origin + path, data=payload, headers=headers, method=method)
+              try:
+                  with opener.open(req, timeout=24) as response:
+                      return response.status, response.url, response.read(900000).decode("utf-8", "replace")
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.url, exc.read(250000).decode("utf-8", "replace")
+          def api(path, nonce, method="GET", payload=None):
+              status, url, raw = request(path, method=method, payload=payload, nonce=nonce)
+              try:
+                  result = json.loads(raw)
+              except ValueError:
+                  result = {"non_json":raw[:100]}
+              if status >= 400:
+                  print("AAM_API_ERROR", method, path.split("?")[0], "status",status,
+                        "code",result.get("code") if isinstance(result,dict) else None)
+                  raise RuntimeError("AAM REST request failed")
+              return result
+          def login():
+              status,_,_ = request("/wp-login.php")
+              if status != 200: raise RuntimeError("WordPress login page unavailable")
+              fields = urllib.parse.urlencode({
+                  "log":os.environ["WP_ADMIN_USERNAME"],
+                  "pwd":os.environ["WP_ADMIN_PASSWORD"],
+                  "wp-submit":"Log In",
+                  "redirect_to":origin+"/wp-admin/",
+                  "testcookie":"1"}).encode()
+              status,_,_ = request("/wp-login.php", method="POST", payload=fields)
+              if not any(c.name.startswith("wordpress_logged_in_") for c in jar):
+                  raise RuntimeError("WordPress admin login unsuccessful")
+              status,_,raw = request("/wp-admin/admin-ajax.php?action=rest-nonce")
+              if status != 200 or not re.fullmatch(r"[a-f0-9]{8,12}",raw.strip()):
+                  raise RuntimeError("WP REST nonce unavailable")
+              return raw.strip()
+
+          if not os.environ.get("WP_ADMIN_USERNAME") or not os.environ.get("WP_ADMIN_PASSWORD"):
+              sys.exit("FAIL: Missing WordPress admin secrets.")
+          nonce = login()
+          roles = api("/wp-json/aam/v2/roles",nonce)
+          chosen = [x for x in roles if re.sub(r"\s+","_",str(x.get("name","")).strip()).upper()=="DUONGTHINH_ADMIN"]
+          if len(chosen)!=1 or not chosen[0].get("slug"):
+              sys.exit("FAIL: Unique DUONGTHINH_ADMIN role not found; aborting.")
+          slug = chosen[0]["slug"]
+          print("ROLE_CONFIRMED DUONGTHINH_ADMIN")
+          me = api("/wp-json/wp/v2/users/me?context=edit",nonce)
+          caps = me.get("capabilities") or {}
+          if not caps.get("edit_pages") or not caps.get("manage_options"):
+              sys.exit("FAIL: Authenticated account lacks page/edit administration capabilities.")
+          print("WORDPRESS_CAPS_CONFIRMED edit_pages and manage_options")
+
+          target_slugs = [
+              "menu/edit.php?post_type=page",
+              "edit.php?post_type=page",
+              "post-new.php?post_type=page",
+          ]
+          params = urllib.parse.urlencode({"access_level":"role","role_id":slug})
+          def get_menu():
+              items = api("/wp-json/aam/v2/backend-menu?"+params, nonce)
+              if not isinstance(items,list): raise RuntimeError("AAM backend menu did not return items")
+              flattened=[]
+              for x in items:
+                  flattened.append(x)
+                  flattened.extend(x.get("children",[]) or [])
+              byslug={x.get("slug"):x for x in flattened}
+              if any(k not in byslug for k in target_slugs):
+                  print("MENU_LOOKUP_MISSING", [k for k in target_slugs if k not in byslug])
+                  raise RuntimeError("Expected WordPress Pages menu entries absent")
+              return byslug
+          menu_before = get_menu()
+          settings_before = api("/wp-json/aam/v2/settings",nonce)
+          role_data = settings_before.get("role",{}).get(slug,{})
+          original_rules = (role_data.get("backend_menu") or {})
+          for key in target_slugs:
+              item = menu_before[key]
+              print("BEFORE",key,"is_restricted",item.get("is_restricted"),
+                    "has_explicit_rule",key in original_rules,
+                    "rule_access",original_rules.get(key,{}).get("access"),
+                    "is_inherited",item.get("is_inherited","unknown"))
+          changes=[]
+          def rule_path(item):
+              ident = str(item["id"])
+              return "/wp-json/aam/v2/backend-menu/" + urllib.parse.quote(ident,safe="") + "?" + params
+          def set_restriction(item, restricted):
+              return api(rule_path(item),nonce,"PATCH",{"is_restricted":restricted,"access_level":"role","role_id":slug})
+          def reset_rule(item):
+              return api(rule_path(item),nonce,"DELETE")
+          try:
+              for key in target_slugs:
+                  item = menu_before[key]
+                  if item.get("is_restricted") is False:
+                      print("UNCHANGED already accessible:",key)
+                      continue
+                  response = set_restriction(item,False)
+                  print("UPDATED",key,"restricted",response.get("is_restricted") if isinstance(response,dict) else "(unknown)")
+                  changes.append(key)
+
+              menu_after = get_menu()
+              for key in target_slugs:
+                  item = menu_after[key]
+                  print("AFTER",key,"is_restricted",item.get("is_restricted"))
+                  if item.get("is_restricted") is not False:
+                      raise RuntimeError("AAM still restricts target "+key)
+
+              settings_after = api("/wp-json/aam/v2/settings",nonce)
+              before_unrelated = copy.deepcopy(settings_before)
+              after_unrelated  = copy.deepcopy(settings_after)
+              for snapshot in (before_unrelated,after_unrelated):
+                  target_map=snapshot.get("role",{}).get(slug,{}).get("backend_menu",{})
+                  for key in target_slugs:target_map.pop(key,None)
+              if before_unrelated != after_unrelated:
+                  print("WARNING: AAM reports additional setting differences; not automatically reverting unrelated changes.")
+              else:
+                  print("PASS: All unrelated AAM rules are unchanged.")
+              print("SUCCESS: Three DUONGTHINH_ADMIN Pages menu entries are unrestricted.")
+          except Exception:
+              print("FAIL: AAM update verification failed. Attempting targeted rollback.")
+              for key in reversed(changes):
+                  try:
+                      item=menu_before[key]
+                      if key not in original_rules:
+                          reset_rule(item)
+                      else:
+                          set_restriction(item,bool(menu_before[key].get("is_restricted",True)))
+                      print("ROLLBACK_OK",key)
+                  except Exception as exc:
+                      print("ROLLBACK_FAILED",key,type(exc).__name__)
+              raise
+
+          # A fresh request to the actual admin URLs tests whether user-specific rules still block access.
+          for path in ["/wp-admin/edit.php?post_type=page",
+                       "/wp-admin/post-new.php?post_type=page",
+                       "/wp-admin/post.php?post=2&action=edit"]:
+              status,url,html = request(path)
+              print("ADMIN_ACCESS_CHECK",path,"status",status,
+                    "access_denied",bool(re.search("The access is denied",html,re.I)))
+          print("WORKFLOW_COMPLETED")
+          PY

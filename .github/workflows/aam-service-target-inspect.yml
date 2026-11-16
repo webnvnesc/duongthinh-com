@@ -1,0 +1,45 @@
+name: Inspect AAM menu service targeting parameters
+
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/aam-service-target-inspect.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      FTP_SERVER: ${{ secrets.FTP_SERVER }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+    steps:
+      - name: Read AAM backend menu service binding implementation
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,ftplib
+          from urllib.parse import urlsplit
+          s=os.environ["FTP_SERVER"];p=urlsplit(s if "://" in s else "//"+s)
+          f=ftplib.FTP_TLS();root="/domains/duongthinh.com/public_html/wp-content/plugins/advanced-access-manager/application/Restful"
+          try:
+            f.connect(p.hostname,p.port or 21,timeout=15);f.auth();f.login(os.environ["FTP_USERNAME"],os.environ["FTP_PASSWORD"]);f.prot_p()
+            f.cwd(root)
+            for name in ["BackendMenu.php","ServiceTrait.php"]:
+              b=bytearray();f.retrbinary("RETR "+name,b.extend)
+              lines=b.decode("utf-8","replace").splitlines()
+              if name=="BackendMenu.php":ranges=[(60,83),(100,160),(162,211)]
+              else:ranges=[(1,min(270,len(lines)))]
+              for a,z in ranges:
+                print("FILE_RANGE",name,a,z)
+                for i in range(a-1,min(z,len(lines))):
+                  line=lines[i]
+                  if "password" in line.lower() or "token" in line.lower():continue
+                  print(str(i+1)+": "+line[:250])
+          finally:
+            try:f.quit()
+            except Exception:f.close()
+          PY

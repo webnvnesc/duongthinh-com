@@ -1,0 +1,75 @@
+name: Diagnose remaining AAM Pages 401 after role change
+
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/aam-pages-remaining-401.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+    steps:
+      - name: Compare authenticated user access with AAM role and individual rules
+        run: |
+          python3 - <<'PY'
+          import urllib.request,urllib.error,urllib.parse,http.cookiejar,json,os,re,ssl
+          base="https://duongthinh.com";jar=http.cookiejar.CookieJar()
+          op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar),
+              urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+          def req(path,data=None,nonce=None):
+              h={"User-Agent":"Mozilla/5.0 (compatible; AAMAccessVerify/1.0)"}
+              if data is not None:h["Content-Type"]="application/x-www-form-urlencoded"
+              if nonce:h["X-WP-Nonce"]=nonce
+              r=urllib.request.Request(base+path,headers=h,data=data)
+              try:
+                  with op.open(r,timeout=24) as x:return x.status,x.read(900000).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:return e.code,e.read(400000).decode('utf-8','replace')
+          req('/wp-login.php')
+          code,_=req('/wp-login.php',urllib.parse.urlencode({'log':os.environ['WP_ADMIN_USERNAME'],
+              'pwd':os.environ['WP_ADMIN_PASSWORD'],'wp-submit':'Log In',
+              'redirect_to':base+'/wp-admin/','testcookie':'1'}).encode())
+          if not any(c.name.startswith('wordpress_logged_in_') for c in jar):raise Exception("Auth failed")
+          code,nonce=req('/wp-admin/admin-ajax.php?action=rest-nonce');nonce=nonce.strip()
+          print("NONCE_OK",code==200)
+          def fetch(path):
+              status,raw=req(path,nonce=nonce)
+              try:data=json.loads(raw)
+              except Exception:data={}
+              return status,data
+          st,me=fetch('/wp-json/wp/v2/users/me?context=edit')
+          myroles=me.get('roles',[]) if isinstance(me,dict) else []
+          print("USER_ID",me.get("id"),"ROLE_COUNT",len(myroles))
+          st,roles=fetch('/wp-json/aam/v2/roles')
+          print("CUSTOM_ADMIN_MATCHES",[(r.get('name'),r.get('slug') in myroles) for r in roles if r.get('name')=='DUONGTHINH_ADMIN' or r.get('name')=='DUONG THINH'])
+          role=[r.get('slug') for r in roles if r.get('name')=='DUONGTHINH_ADMIN']
+          if len(role)!=1:raise Exception("Role not found")
+          slug=role[0]
+          for typ,p in [("role",{"access_level":"role","role_id":slug}),
+                        ("user",{"access_level":"user","user_id":me.get("id")})]:
+              q=urllib.parse.urlencode(p)
+              st,menu=fetch('/wp-json/aam/v2/backend-menu?'+q)
+              if not isinstance(menu,list):
+                  print("MENU_ERROR",typ,st,str(menu)[:300]);continue
+              items=[u for x in menu for u in [x]+x.get("children",[])]
+              subset=[(x.get("slug"),x.get("is_restricted")) for x in items if
+                    "post_type=page" in str(x.get("slug")) or x.get("slug") in ["menu/edit.php","edit.php"]]
+              print("MENU_STATUS",typ,subset)
+          st,settings=fetch('/wp-json/aam/v2/settings')
+          for typ,key in [("role",slug),("user",str(me.get('id')))]:
+              x=settings.get(typ,{}).get(key,{})
+              print("SETTINGS_SCOPE",typ,"sections",list(x.keys()))
+              m=x.get('backend_menu',{})
+              print("PAGES_RULES",typ,[(k,v) for k,v in m.items() if 'post_type=page' in k or k in ('menu/edit.php','edit.php')])
+              print("URL_RULE_SUMMARY",typ,str(x.get('uri',x.get('url',{})))[:350])
+          for p in ['/wp-admin/edit.php?post_type=page','/wp-admin/post.php?post=2&action=edit','/wp-admin/edit.php']:
+              st,raw=req(p)
+              print("HTTP_ACCESS",p,st,'aam_markers',("access is denied" in raw.lower()),
+                    'html_prefix',re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',raw))[:180])
+          PY

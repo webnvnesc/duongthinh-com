@@ -1,0 +1,118 @@
+name: Verify DUONG THINH Pages editor after AAM rules update
+
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/aam-duongthinh-verify.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+    steps:
+      - name: Validate Pages menu and WordPress edit screens with authenticated session
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import urllib.request,urllib.error,urllib.parse,http.cookiejar,ssl,json,re,os,sys
+          from html.parser import HTMLParser
+          class Scanner(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.title=False
+                  self.title_parts=[]
+                  self.bodyclasses=""
+                  self.adminmenu=False
+                  self.postform=False
+                  self.postid=""
+                  self.errors=[]
+              def handle_starttag(self,tag,attrs):
+                  d=dict(attrs)
+                  if tag=="title":self.title=True
+                  if tag=="body":self.bodyclasses=d.get("class","")
+                  if d.get("id")=="adminmenu":self.adminmenu=True
+                  if d.get("id")=="post":self.postform=True
+                  if d.get("id")=="post_ID":self.postid=d.get("value","")
+                  if "wp-die-message" in d.get("class",""):self.errors.append("wp-die-message")
+              def handle_endtag(self,tag):
+                  if tag=="title":self.title=False
+              def handle_data(self,data):
+                  if self.title:self.title_parts.append(data[:100])
+          site="https://duongthinh.com"
+          jar=http.cookiejar.CookieJar()
+          opener=urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(jar),
+              urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+          def req(path,data=None,nonce=None):
+              h={"User-Agent":"Mozilla/5.0 (compatible; WPPageAccessValidation/1.0)"}
+              if data is not None:h["Content-Type"]="application/x-www-form-urlencoded"
+              if nonce:h["X-WP-Nonce"]=nonce
+              r=urllib.request.Request(site+path,headers=h,data=data)
+              try:
+                  with opener.open(r,timeout=22) as x:
+                      return x.status,x.url,x.read(1200000).decode("utf-8","replace")
+              except urllib.error.HTTPError as e:
+                  return e.code,e.url,e.read(300000).decode("utf-8","replace")
+          req("/wp-login.php")
+          fields=urllib.parse.urlencode({"log":os.environ["WP_ADMIN_USERNAME"],
+              "pwd":os.environ["WP_ADMIN_PASSWORD"],"wp-submit":"Log In",
+              "redirect_to":site+"/wp-admin/","testcookie":"1"}).encode()
+          req("/wp-login.php",fields)
+          if not any(c.name.startswith("wordpress_logged_in_") for c in jar):
+              sys.exit("FAIL: Cannot authenticate to WordPress")
+          st,_,nonce=req("/wp-admin/admin-ajax.php?action=rest-nonce")
+          if st!=200 or not re.fullmatch(r"[0-9a-f]{8,12}",nonce.strip()):
+              sys.exit("FAIL: WordPress REST nonce unavailable")
+          nonce=nonce.strip()
+          st,_,raw=req("/wp-json/wp/v2/users/me?context=edit",nonce=nonce)
+          me=json.loads(raw)
+          st,_,raw=req("/wp-json/aam/v2/roles",nonce=nonce)
+          roles=json.loads(raw)
+          chosen=[r for r in roles if r.get("name")=="DUONG THINH"]
+          if len(chosen)!=1 or chosen[0]["slug"] not in me.get("roles",[]):
+              sys.exit("FAIL: Unexpected authenticated WordPress role")
+          q=urllib.parse.urlencode({"access_level":"role","role_id":chosen[0]["slug"]})
+          st,_,raw=req("/wp-json/aam/v2/backend-menu?"+q,nonce=nonce)
+          items=json.loads(raw)
+          allrows=[x for row in items for x in [row]+(row.get("children") or [])]
+          byslug={row.get("slug"):row for row in allrows}
+          keys=["menu/edit.php?post_type=page","edit.php?post_type=page","post-new.php?post_type=page"]
+          for key in keys:
+              item=byslug.get(key)
+              print("AAM_PAGES_RULE",key,"restricted",item.get("is_restricted") if item else None)
+              if not item or item.get("is_restricted") is not False:
+                  sys.exit("FAIL: AAM still blocks "+key)
+          checks=[
+              ("pages-list","/wp-admin/edit.php?post_type=page"),
+              ("create-page","/wp-admin/post-new.php?post_type=page"),
+              ("homepage-editor","/wp-admin/post.php?post=2&action=edit"),
+              ("news-editor","/wp-admin/post.php?post=356&action=edit")
+          ]
+          good=True
+          for label,path in checks:
+              status,url,body=req(path)
+              scanner=Scanner()
+              scanner.feed(body)
+              actual_path=urllib.parse.urlparse(url).path
+              title=" ".join(scanner.title_parts)[:115]
+              has_form=('name="post"' in body or "id='post'" in body or 'id="post"' in body or 'id="post_ID"' in body)
+              denial=bool(re.search(r'<(?:div|p)[^>]*class=["\\'][^"\\']*wp-die-message',body,re.I))
+              has_wp_admin=bool(re.search(r'id=["\\'](?:wpadminbar|wpbody|adminmenu)["\\']',body,re.I))
+              passed=status==200 and actual_path==urllib.parse.urlparse(site+path).path and not denial and has_wp_admin
+              print("VERIFY",label,"HTTP",status,"adminUI",has_wp_admin,
+                    "pageEditorForm",has_form,"deniedUI",denial,"pass",passed,
+                    "title",title)
+              if not passed:good=False
+          st,_,raw=req("/wp-json/wp/v2/pages?context=edit&per_page=1",nonce=nonce)
+          print("PAGES_REST_EDIT",st)
+          if st!=200:good=False
+          print("FINAL_RESULT", "PASS" if good else "FAIL")
+          if not good:sys.exit(1)
+          PY

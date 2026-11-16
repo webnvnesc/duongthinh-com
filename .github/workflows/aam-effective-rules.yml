@@ -1,0 +1,86 @@
+name: Inspect AAM effective access rules
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/aam-effective-rules.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+    steps:
+      - name: Read AAM effective per-user and backend menu rules
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,re,json,ssl,http.cookiejar,urllib.error,urllib.parse,urllib.request,sys
+          base="https://duongthinh.com"
+          jar=http.cookiejar.CookieJar()
+          opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+          def call(path,data=None,nonce=None):
+            headers={"User-Agent":"Mozilla/5.0 (compatible; AAMReadOnly/1.0)","Accept":"application/json,text/html,*/*"}
+            if data is not None:headers["Content-Type"]="application/x-www-form-urlencoded"
+            if nonce:headers["X-WP-Nonce"]=nonce
+            req=urllib.request.Request(base+path,data=data,headers=headers)
+            try:
+              with opener.open(req,timeout=16) as r:
+                return r.status,r.read(350000).decode("utf-8","replace")
+            except urllib.error.HTTPError as e:
+              return e.code,e.read(100000).decode("utf-8","replace")
+          def summarized(raw):
+            try:
+              x=json.loads(raw)
+            except Exception:
+              return {"parse":"non-json"}
+            if isinstance(x,list):
+              return {"type":"list","length":len(x),"sample":[walk(a) for a in x[:8]]}
+            return walk(x)
+          def walk(x,level=0):
+            if level>4:return "..."
+            if isinstance(x,dict):
+              result={}
+              for k,v in list(x.items())[:40]:
+                key=k.lower()
+                if any(s in key for s in ("token","secret","password","nonce","email","ip_address","ipaddress","user_login")):continue
+                result[k]=walk(v,level+1)
+              return result
+            if isinstance(x,list):return [walk(v,level+1) for v in x[:25]]
+            if isinstance(x,str):return x[:250]
+            return x
+          call("/wp-login.php")
+          form=urllib.parse.urlencode({"log":os.environ["WP_ADMIN_USERNAME"],
+            "pwd":os.environ["WP_ADMIN_PASSWORD"],"wp-submit":"Log In",
+            "redirect_to":base+"/wp-admin/","testcookie":"1"}).encode()
+          status,body=call("/wp-login.php",form)
+          if not any(c.name.startswith("wordpress_logged_in_") for c in jar):
+            sys.exit("FAIL: login unsuccessful")
+          nstatus,nonce=call("/wp-admin/admin-ajax.php?action=rest-nonce")
+          if nstatus!=200 or not re.fullmatch('[a-f0-9]{8,12}',nonce.strip()):
+            sys.exit("FAIL: nonce unavailable")
+          nonce=nonce.strip()
+          for p in [
+              "/wp-json/aam/v2/user/2",
+              "/wp-json/aam/v2/identity/user/2",
+              "/wp-json/aam/v2/backend-menu",
+              "/wp-json/aam/v2/urls",
+              "/wp-json/aam/v2/configs",
+              "/wp-json/aam/v2/settings",
+              "/wp-json/aam/v2/roles",
+              "/wp-json/aam/v2/redirect/access-denied",
+              "/wp-json/aam/v2/policies",
+              "/wp-json/aam/v2/configpress"]:
+            status,raw=call(p,nonce=nonce)
+            x=summarized(raw)
+            print("AAM_ENDPOINT",p,"HTTP",status,"RESULT",json.dumps(x,ensure_ascii=False)[:8500])
+          print("SUCCESS: AAM configuration endpoint inspection complete (no settings changed).")
+          PY

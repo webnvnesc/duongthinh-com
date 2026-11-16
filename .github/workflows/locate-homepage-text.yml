@@ -1,0 +1,116 @@
+name: Locate editable homepage text in WordPress
+
+on:
+  push:
+    branches: [master]
+    paths: [".github/workflows/locate-homepage-text.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  locate:
+    name: Identify homepage page ID and WordPress editor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    env:
+      WP_ADMIN_USERNAME: ${{ secrets.WP_ADMIN_USERNAME }}
+      WP_ADMIN_PASSWORD: ${{ secrets.WP_ADMIN_PASSWORD }}
+    steps:
+      - name: Inspect public homepage and WordPress page editor read-only
+        shell: bash
+        run: |
+          python3 -m pip install --quiet beautifulsoup4
+          python3 - <<'PY'
+          import re, json, os, ssl, sys, urllib.request, urllib.parse, urllib.error, http.cookiejar
+          from bs4 import BeautifulSoup
+          BASE="https://duongthinh.com"
+          sslcontext=ssl.create_default_context()
+          cookies=http.cookiejar.CookieJar()
+          opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookies),
+              urllib.request.HTTPSHandler(context=sslcontext))
+          def fetch(url,data=None):
+              req=urllib.request.Request(url,data=data,headers={
+                  "User-Agent":"Mozilla/5.0 (compatible; WordPressReadOnlyLocator/1.0)",
+                  "Accept":"text/html,application/xhtml+xml,application/json,*/*",
+                  **({"Content-Type":"application/x-www-form-urlencoded","Referer":BASE+"/wp-login.php"} if data is not None else {})
+              })
+              with opener.open(req,timeout=25) as resp:
+                  return resp.status,resp.url,resp.read(2500000).decode('utf-8','replace')
+
+          def normalize(x):
+              return re.sub(r'\s+',' ',str(x or '')).strip()
+          try:
+              status,final,html=fetch(BASE+'/')
+          except Exception as exc:
+              print("PUBLIC_ERROR",type(exc).__name__)
+              sys.exit(1)
+          soup=BeautifulSoup(html,'html.parser')
+          body=soup.body
+          bodyclasses=body.get('class',[]) if body else []
+          print("PUBLIC_STATUS",status)
+          print("PUBLIC_TITLE",normalize(soup.title.get_text(' ',strip=True)) if soup.title else '')
+          print("PUBLIC_BODY_CLASSES",' '.join(bodyclasses)[:600])
+          ids=re.findall(r'page-id-(\d+)', ' '.join(bodyclasses))
+          homepageid=ids[0] if ids else None
+          print("PUBLIC_PAGE_ID",homepageid)
+          print("PUBLIC_EDIT_LINK_HINTS", [(a.get('href','')[:180],normalize(a.get_text(' ',strip=True))[:100]) for a in soup.select('a[href*="post.php?post="]')][:5])
+          needles=["THIẾT KẾ THI CÔNG","Công ty Cổ Phần Thiết kế","Với đội ngũ kỹ sư","Đã thi công rất nhiều công trình"]
+          for needle in needles:
+              found=soup.find(string=lambda t: t is not None and needle.lower() in normalize(t).lower())
+              if not found:
+                  print("MATCH_MISSING",needle)
+                  continue
+              print("MATCH_FOUND",needle)
+              p=found.parent
+              for level in range(0,8):
+                  if not p or p.name in ('html','body'):break
+                  print("ANCESTOR",needle[:14],level,p.name,
+                        "id="+str(p.get("id",""))[:90],
+                        "class="+str(p.get("class",[]))[:220],
+                        "data="+str({k:v for k,v in p.attrs.items() if k.startswith("data-")})[:200],
+                        "text="+normalize(p.get_text(' ',strip=True))[:110])
+                  p=p.parent
+          if homepageid:
+              try:
+                  status,url,pagejson=fetch(BASE+'/wp-json/wp/v2/pages/'+homepageid)
+                  obj=json.loads(pagejson)
+                  rendered=obj.get('content',{}).get('rendered','')
+                  print("REST_PAGE",obj.get('id'),"title="+normalize(obj.get('title',{}).get('rendered',''))[:130],
+                        "slug="+str(obj.get("slug","")),"link="+str(obj.get("link","")),
+                        "contentContainsText="+str(any(x.lower() in rendered.lower() for x in needles)),
+                        "contentLength="+str(len(rendered)))
+              except Exception as e:
+                  print("REST_PAGE_UNAVAILABLE",type(e).__name__)
+          user=os.environ.get('WP_ADMIN_USERNAME','')
+          pwd=os.environ.get('WP_ADMIN_PASSWORD','')
+          if not user or not pwd:
+              print("ADMIN_SECRETS_MISSING")
+              sys.exit(0)
+          try:
+              status,url,login=fetch(BASE+'/wp-login.php')
+              form=urllib.parse.urlencode({"log":user,"pwd":pwd,"wp-submit":"Log In",
+                  "redirect_to":BASE+"/wp-admin/","testcookie":"1"}).encode()
+              status,url,_=fetch(BASE+'/wp-login.php',form)
+              authed=any(c.name.startswith(("wordpress_logged_in_","wordpress_sec_")) for c in cookies)
+              print("ADMIN_LOGIN_COOKIE",authed,"responsePath",urllib.parse.urlparse(url).path)
+              if not authed or not homepageid:sys.exit(0)
+              edit=BASE+'/wp-admin/post.php?post='+homepageid+'&action=edit'
+              status,url,page=fetch(edit)
+              edit_soup=BeautifulSoup(page,'html.parser')
+              path=urllib.parse.urlparse(url).path
+              print("EDITOR_HTTP",status,"path",path)
+              print("EDITOR_PAGE_ID",homepageid)
+              print("EDITOR_TITLE_TAG",normalize(edit_soup.title.get_text(' ',strip=True))[:130] if edit_soup.title else '')
+              print("EDITOR_PAGE_TITLE",str((edit_soup.select_one('input#title') or {}).get('value',''))[:140])
+              print("EDITOR_BODY_CLASS"," ".join(edit_soup.body.get('class',[]))[:300] if edit_soup.body else '')
+              print("EDITOR_BUILDER_HINTS",
+                    {x:bool(re.search(x,page,re.I)) for x in ["ux-builder","uxbuilder","UX Builder","classic-editor","wp-editor-area","block-editor","Gutenberg"]})
+              print("EDITOR_TEXT_MATCHES",{x:bool(x.lower() in page.lower()) for x in needles})
+              print("EDITOR_TEXTAREA_NAMES",[t.get('name') for t in edit_soup.select('textarea')][:20])
+              print("EDITOR_EDIT_LINKS",[(a.get('href','')[:220],normalize(a.get_text(' ',strip=True))[:70]) for a in edit_soup.select('a[href*="uxbuilder"],a[href*="ux-builder"],a[href*="post.php?post="]')][:12])
+              print("EDITOR_POST_ID_INPUT", str((edit_soup.select_one('input#post_ID') or {}).get('value','')))
+          except Exception as exc:
+              print("ADMIN_EDIT_DIAGNOSTIC_ERROR",type(exc).__name__)
+          PY
